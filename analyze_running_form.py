@@ -214,14 +214,14 @@ class RunningFormAnalyzer:
     def fix_lr_swaps(self):
         """Detect and fix left/right landmark identity swaps.
 
-        MediaPipe sometimes confuses which foot is left vs right, causing
-        smooth position crossovers. Detected by monitoring the sign of
-        L_heel_x - R_heel_x: the dominant sign is "correct", and frames
-        where it flips with a large magnitude are swapped.
+        MediaPipe sometimes swaps which foot is left vs right. During
+        normal running the feet cross naturally (gradual), but a swap
+        event shows as a sudden large jump in the L-R heel X difference
+        (~200px in one frame). We detect these jump events, pair them
+        (swap-in / swap-out), and unswap the frames between each pair.
         """
         print("\n--- Fixing left/right landmark swaps ---")
 
-        # Left/right landmark pairs to swap together
         lr_pairs = [
             (LM_LEFT_HIP, LM_RIGHT_HIP),
             (LM_LEFT_KNEE, LM_RIGHT_KNEE),
@@ -231,30 +231,71 @@ class RunningFormAnalyzer:
             (LM_LEFT_SHOULDER, LM_RIGHT_SHOULDER),
         ]
 
-        # Use heel X positions to determine which frames are swapped
+        n = self.lm_x.shape[0]
         l_x = self.lm_x[:, LM_LEFT_HEEL] * self.width
         r_x = self.lm_x[:, LM_RIGHT_HEEL] * self.width
         diff = l_x - r_x
 
-        # Determine the dominant sign (which side L heel is usually on)
-        valid = diff[~np.isnan(diff)]
-        if len(valid) == 0:
-            return
-        dominant_sign = np.sign(np.median(valid))
+        # Detect swap events: sudden jumps in the L-R difference.
+        # A real swap causes ~200px swing in one frame; natural crossing
+        # changes by only a few px per frame.
+        diff_delta = np.diff(diff)
+        swap_threshold = 80.0  # px jump in L-R diff in one frame
 
-        # Frames where sign disagrees with dominant AND the magnitude is
-        # significant (not just the feet crossing during a stride)
-        min_swap_magnitude = 20.0  # px — real swaps are ~80-120px
-        swapped = (np.sign(diff) != dominant_sign) & (np.abs(diff) > min_swap_magnitude)
-        n_swapped = np.sum(swapped)
+        # Find swap event frames
+        swap_events = np.where(np.abs(diff_delta) > swap_threshold)[0]
 
-        if n_swapped == 0:
+        if len(swap_events) == 0:
             print("  No swaps detected")
             return
 
-        print(f"  Detected {n_swapped} swapped frames, unswapping...")
+        # Group nearby events into swap regions. Each region is a
+        # contiguous block where swaps are happening. Within each region,
+        # find the start (first event) and end (last event).
+        regions = []
+        region_start = swap_events[0]
+        region_end = swap_events[0]
+        for i in range(1, len(swap_events)):
+            if swap_events[i] - region_end < 30:  # within ~1s
+                region_end = swap_events[i]
+            else:
+                regions.append((region_start, region_end))
+                region_start = swap_events[i]
+                region_end = swap_events[i]
+        regions.append((region_start, region_end))
 
-        # Swap left/right for all paired landmarks on those frames
+        # For each swap region, determine which frames are swapped by
+        # comparing the L-R diff inside the region to the stable diff
+        # just outside the region.
+        swapped = np.zeros(n, dtype=bool)
+        for start, end in regions:
+            # Get reference diff from frames just before the region
+            ref_start = max(0, start - 10)
+            ref_diff = np.nanmedian(diff[ref_start:start + 1])
+
+            # Mark frames within the region where diff sign disagrees
+            # with the reference (with significant magnitude)
+            for f in range(start + 1, min(end + 2, n)):
+                if np.sign(diff[f]) != np.sign(ref_diff) and \
+                   np.abs(diff[f]) > 30.0:
+                    swapped[f] = True
+
+        n_swapped = np.sum(swapped)
+        if n_swapped == 0:
+            print("  No swaps detected after region analysis")
+            return
+
+        t_ranges = []
+        for start, end in regions:
+            region_count = np.sum(swapped[start:end + 2])
+            if region_count > 0:
+                t_ranges.append(
+                    f"{start / self.fps:.1f}-{(end + 1) / self.fps:.1f}s "
+                    f"({region_count} frames)")
+        print(f"  Detected {n_swapped} swapped frames in {len(t_ranges)} regions:")
+        for tr in t_ranges:
+            print(f"    {tr}")
+
         for l_idx, r_idx in lr_pairs:
             self.lm_x[swapped, l_idx], self.lm_x[swapped, r_idx] = \
                 self.lm_x[swapped, r_idx].copy(), self.lm_x[swapped, l_idx].copy()
