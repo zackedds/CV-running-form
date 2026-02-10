@@ -539,6 +539,9 @@ class RunningFormAnalyzer:
 
     def run(self, output_dir="output", generate_video=True):
         """Run the full analysis pipeline."""
+        # Create per-video subfolder inside output_dir
+        video_name = os.path.splitext(os.path.basename(self.video_path))[0]
+        output_dir = os.path.join(output_dir, video_name)
         os.makedirs(output_dir, exist_ok=True)
 
         # Phase 1: Extract landmarks
