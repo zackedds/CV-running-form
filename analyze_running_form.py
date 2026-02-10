@@ -211,103 +211,168 @@ class RunningFormAnalyzer:
         print(f"  Done. Landmarks detected in {det_count}/{frame_idx} frames "
               f"({100 * det_count / max(frame_idx, 1):.1f}%)")
 
-    def correct_landmarks(self, delta_threshold_px=30.0, smooth_window=5):
-        """Detect and fix landmark jitter by interpolating outlier frames,
-        then apply light smoothing to all landmarks.
+    def correct_landmarks(self, mad_multiplier=8.0, smooth_window=5):
+        """Detect and fix landmark jitter using adaptive per-landmark thresholds.
+
+        Fits a baseline from the median of frame-to-frame deltas, then flags
+        anything beyond median + mad_multiplier * MAD as an outlier. Outlier
+        frames are replaced with linearly interpolated values from the nearest
+        valid neighbors, then a light smoothing pass is applied.
 
         Args:
-            delta_threshold_px: max allowed frame-to-frame pixel jump before
-                marking a frame as an outlier.
-            smooth_window: moving average window size for final smoothing.
+            mad_multiplier: how many MADs above the median to set the cutoff.
+                8.0 gives ~7px threshold for typical slowmo running video.
+            smooth_window: moving average window for final smoothing pass.
         """
-        print(f"\n--- Correcting landmark jitter ---")
-        print(f"  Delta threshold: {delta_threshold_px}px, "
-              f"smooth window: {smooth_window}")
+        print(f"\n--- Correcting landmark jitter (adaptive threshold) ---")
 
         n = self.lm_x.shape[0]
         total_fixed = 0
+        self._jitter_stats = []  # store per-landmark stats for plotting
 
         for lm_idx in range(NUM_LANDMARKS):
             x = self.lm_x[:, lm_idx].copy()
             y = self.lm_y[:, lm_idx].copy()
 
-            # Convert to pixel space for threshold comparison
             x_px = x * self.width
             y_px = y * self.height
 
-            # Compute frame-to-frame delta in pixels
+            # Frame-to-frame deltas in pixel space
             dx = np.diff(x_px)
             dy = np.diff(y_px)
             deltas = np.sqrt(dx**2 + dy**2)
+            valid_deltas = deltas[~np.isnan(deltas)]
 
-            # Find outlier frames: where delta exceeds threshold
-            # An outlier frame i means the jump FROM i-1 TO i was too big
+            if len(valid_deltas) == 0:
+                continue
+
+            # Fit baseline: median delta is the "normal" movement per frame
+            baseline = np.median(valid_deltas)
+            mad = np.median(np.abs(valid_deltas - baseline))
+            # Guard against MAD=0 (perfectly static landmark): use 0.5px floor
+            mad = max(mad, 0.5)
+            threshold = baseline + mad_multiplier * mad
+
+            self._jitter_stats.append({
+                "lm_idx": lm_idx,
+                "baseline": baseline,
+                "mad": mad,
+                "threshold": threshold,
+            })
+
+            # Iterative delta-based cleaning: flag destination frames of any
+            # delta that exceeds threshold, NaN them out, interpolate from
+            # valid neighbors, then recompute deltas. Repeat until no new
+            # outliers are found. This avoids the "stuck anchor" problem.
             outlier_mask = np.zeros(n, dtype=bool)
-            for i in range(len(deltas)):
-                if deltas[i] > delta_threshold_px:
-                    outlier_mask[i + 1] = True
+            frames_arr = np.arange(n)
+            for _pass in range(10):  # safety cap on iterations
+                cx_px = x * self.width
+                cy_px = y * self.height
+                cdx = np.diff(cx_px)
+                cdy = np.diff(cy_px)
+                cdeltas = np.sqrt(cdx**2 + cdy**2)
 
-            # Also check if the frame AFTER an outlier snaps back
-            # (teleport-and-return pattern): mark the outlier frame
-            for i in range(1, n - 1):
-                if outlier_mask[i]:
-                    # Check if next frame snaps back near the frame before
-                    if i + 1 < n and not np.isnan(x_px[i - 1]):
-                        snap_back = np.sqrt(
-                            (x_px[i + 1] - x_px[i - 1])**2 +
-                            (y_px[i + 1] - y_px[i - 1])**2
-                        )
-                        # If it snaps back within threshold, this is a single-
-                        # frame glitch — mark only frame i
-                        if snap_back < delta_threshold_px:
-                            continue
-                    # If it doesn't snap back, this might be a multi-frame
-                    # glitch — keep scanning forward
-                    j = i + 1
-                    while j < n:
-                        d = np.sqrt(
-                            (x_px[j] - x_px[i - 1])**2 +
-                            (y_px[j] - y_px[i - 1])**2
-                        )
-                        if d < delta_threshold_px:
-                            break
-                        outlier_mask[j] = True
-                        j += 1
+                new_outliers = 0
+                for i in range(len(cdeltas)):
+                    if cdeltas[i] > threshold and not outlier_mask[i + 1]:
+                        outlier_mask[i + 1] = True
+                        new_outliers += 1
 
-            n_outliers = np.sum(outlier_mask)
-            if n_outliers > 0:
-                total_fixed += n_outliers
-                # Replace outlier positions with NaN, then interpolate
-                x[outlier_mask] = np.nan
-                y[outlier_mask] = np.nan
+                if new_outliers == 0:
+                    break
 
-                # Linear interpolation over NaN gaps
-                valid = ~np.isnan(x)
+                # NaN out outliers and interpolate from valid neighbors
+                x_clean = self.lm_x[:, lm_idx].copy()
+                y_clean = self.lm_y[:, lm_idx].copy()
+                x_clean[outlier_mask] = np.nan
+                y_clean[outlier_mask] = np.nan
+                valid = ~np.isnan(x_clean)
                 if np.sum(valid) >= 2:
-                    frames = np.arange(n)
-                    x = np.interp(frames, frames[valid], x[valid])
-                    y = np.interp(frames, frames[valid], y[valid])
+                    x = np.interp(frames_arr, frames_arr[valid],
+                                  x_clean[valid])
+                    y = np.interp(frames_arr, frames_arr[valid],
+                                  y_clean[valid])
 
-            # Apply light smoothing
+            total_fixed += np.sum(outlier_mask)
+
+            # Light smoothing pass
             x = smooth(x, window=smooth_window)
             y = smooth(y, window=smooth_window)
 
             self.lm_x[:, lm_idx] = x
             self.lm_y[:, lm_idx] = y
 
-        print(f"  Fixed {total_fixed} outlier landmark-frames across all landmarks")
+        # Print summary for foot landmarks
+        foot_ids = {27, 28, 29, 30, 31, 32}
+        for s in self._jitter_stats:
+            if s["lm_idx"] in foot_ids:
+                print(f"  LM {s['lm_idx']:2d}: baseline={s['baseline']:.1f}px  "
+                      f"MAD={s['mad']:.1f}px  threshold={s['threshold']:.1f}px")
 
-    def generate_jitter_report(self, output_dir):
-        """Generate before/after jitter diagnostic plots."""
+        print(f"  Fixed {total_fixed} outlier landmark-frames total")
+
+    def generate_jitter_report(self, output_dir, raw_lm_x=None, raw_lm_y=None):
+        """Generate jitter diagnostic plots showing raw deltas with fitted
+        baseline/threshold, and corrected Y-positions."""
         print(f"\n--- Generating jitter diagnostic plots ---")
-
-        # We need to re-extract raw landmarks to show before vs after
-        # Instead, just plot the corrected foot positions
-        fig, axes = plt.subplots(3, 1, figsize=(16, 10), sharex=True)
-        fig.suptitle("Corrected Foot Landmark Y-Position (pixels)",
-                     fontsize=14, fontweight="bold")
-
         times = np.arange(self.frame_count) / self.fps
+
+        # --- Plot 1: Raw deltas with baseline & threshold for foot landmarks ---
+        if raw_lm_x is not None:
+            foot_lms = [
+                ("L_Heel", LM_LEFT_HEEL), ("R_Heel", LM_RIGHT_HEEL),
+                ("L_Toe", LM_LEFT_FOOT_INDEX), ("R_Toe", LM_RIGHT_FOOT_INDEX),
+            ]
+            fig, axes = plt.subplots(len(foot_lms), 1, figsize=(16, 14),
+                                     sharex=True)
+            fig.suptitle("Foot Landmark Deltas — Raw with Adaptive Threshold",
+                         fontsize=14, fontweight="bold")
+
+            stats_by_id = {s["lm_idx"]: s for s in self._jitter_stats}
+
+            for ax_idx, (name, idx) in enumerate(foot_lms):
+                raw_x_px = raw_lm_x[:, idx] * self.width
+                raw_y_px = raw_lm_y[:, idx] * self.height
+                dx = np.diff(raw_x_px)
+                dy = np.diff(raw_y_px)
+                deltas = np.sqrt(dx**2 + dy**2)
+
+                ax = axes[ax_idx]
+                ax.plot(times[1:], deltas, linewidth=0.5, alpha=0.7,
+                        color="steelblue", label="raw delta")
+
+                s = stats_by_id.get(idx)
+                if s:
+                    ax.axhline(s["baseline"], color="green", linestyle="-",
+                               linewidth=1.5, alpha=0.8,
+                               label=f"baseline (median={s['baseline']:.1f}px)")
+                    ax.axhline(s["threshold"], color="red", linestyle="--",
+                               linewidth=1.5, alpha=0.8,
+                               label=f"threshold={s['threshold']:.1f}px")
+                    ax.fill_between(times[1:], 0, s["threshold"],
+                                    alpha=0.05, color="green")
+                    outliers = deltas > s["threshold"]
+                    if np.any(outliers):
+                        ax.scatter(times[1:][outliers], deltas[outliers],
+                                   c="red", s=12, zorder=5,
+                                   label=f"outliers ({np.sum(outliers)})")
+
+                ax.set_ylabel("Delta (px)")
+                ax.set_title(name)
+                ax.legend(loc="upper right", fontsize=8)
+
+            axes[-1].set_xlabel("Time (s)")
+            plt.tight_layout()
+            path = os.path.join(output_dir, "delta_with_threshold.png")
+            plt.savefig(path, dpi=150)
+            plt.close()
+            print(f"  Saved {path}")
+
+        # --- Plot 2: Corrected Y-positions ---
+        fig2, axes2 = plt.subplots(3, 1, figsize=(16, 10), sharex=True)
+        fig2.suptitle("Corrected Foot Landmark Y-Position (pixels)",
+                      fontsize=14, fontweight="bold")
 
         for ax_idx, (name, idx) in enumerate([
             ("Left Heel", LM_LEFT_HEEL),
@@ -315,14 +380,21 @@ class RunningFormAnalyzer:
             ("Left Ankle", LM_LEFT_ANKLE),
         ]):
             y_px = self.lm_y[:, idx] * self.height
-            ax = axes[ax_idx]
+            ax = axes2[ax_idx]
+
+            # Show raw as faded background if available
+            if raw_lm_y is not None:
+                raw_y = raw_lm_y[:, idx] * self.height
+                ax.plot(times, raw_y, linewidth=0.5, alpha=0.3, color="red",
+                        label="raw")
+
             ax.plot(times, y_px, linewidth=1.0, color="green",
                     label="corrected")
             ax.set_ylabel("Y position (px)")
             ax.set_title(name)
             ax.legend(loc="upper right")
 
-        axes[-1].set_xlabel("Time (s)")
+        axes2[-1].set_xlabel("Time (s)")
         plt.tight_layout()
         path = os.path.join(output_dir, "corrected_positions.png")
         plt.savefig(path, dpi=150)
@@ -379,9 +451,11 @@ class RunningFormAnalyzer:
         # Phase 1: Extract landmarks
         self.extract_landmarks()
 
-        # Correct jitter
+        # Save raw copies for diagnostic plots, then correct
+        raw_lm_x = self.lm_x.copy()
+        raw_lm_y = self.lm_y.copy()
         self.correct_landmarks()
-        self.generate_jitter_report(output_dir)
+        self.generate_jitter_report(output_dir, raw_lm_x, raw_lm_y)
 
         # Skeleton video from corrected data
         if generate_video:
