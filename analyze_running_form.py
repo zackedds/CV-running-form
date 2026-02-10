@@ -232,15 +232,29 @@ class RunningFormAnalyzer:
         ]
 
         n = self.lm_x.shape[0]
-        l_x = self.lm_x[:, LM_LEFT_HEEL] * self.width
-        r_x = self.lm_x[:, LM_RIGHT_HEEL] * self.width
+        # Work in normalized coordinates (0-1) so thresholds are
+        # resolution-independent. At 640px width the original 80px
+        # threshold = 0.125 normalized.
+        l_x = self.lm_x[:, LM_LEFT_HEEL]
+        r_x = self.lm_x[:, LM_RIGHT_HEEL]
         diff = l_x - r_x
 
         # Detect swap events: sudden jumps in the L-R difference.
-        # A real swap causes ~200px swing in one frame; natural crossing
-        # changes by only a few px per frame.
+        # Use adaptive thresholding (median + 5*MAD of |diff_delta|) so
+        # the detection works regardless of resolution or video speed.
+        # A genuine swap creates a diff_delta that is a massive outlier
+        # (essentially ~2x the full L-R oscillation amplitude in one frame).
         diff_delta = np.diff(diff)
-        swap_threshold = 80.0  # px jump in L-R diff in one frame
+        abs_dd = np.abs(diff_delta)
+        dd_median = np.median(abs_dd[~np.isnan(abs_dd)])
+        dd_mad = np.median(np.abs(abs_dd[~np.isnan(abs_dd)] - dd_median))
+        dd_mad = max(dd_mad, 0.005)  # floor to avoid zero MAD
+        swap_threshold = dd_median + 5.0 * dd_mad
+        # Also enforce a minimum: a swap must jump at least 10% of frame width
+        swap_threshold = max(swap_threshold, 0.10)
+        print(f"  Swap threshold: {swap_threshold:.4f} normalized "
+              f"({swap_threshold * self.width:.0f}px) "
+              f"[median={dd_median:.4f}, MAD={dd_mad:.4f}]")
 
         # Find swap event frames
         swap_events = np.where(np.abs(diff_delta) > swap_threshold)[0]
@@ -275,14 +289,25 @@ class RunningFormAnalyzer:
 
             # Mark frames within the region where diff sign disagrees
             # with the reference (with significant magnitude)
+            mag_threshold = 0.047  # normalized; was 30px at 640px width
             for f in range(start + 1, min(end + 2, n)):
                 if np.sign(diff[f]) != np.sign(ref_diff) and \
-                   np.abs(diff[f]) > 30.0:
+                   np.abs(diff[f]) > mag_threshold:
                     swapped[f] = True
 
         n_swapped = np.sum(swapped)
         if n_swapped == 0:
             print("  No swaps detected after region analysis")
+            return
+
+        # Safety check: if more than 30% of frames flagged as swapped,
+        # the detection is likely wrong (e.g. angled camera view where
+        # L-R diff naturally stays one sign). Skip correction.
+        swap_ratio = n_swapped / n
+        if swap_ratio > 0.30:
+            print(f"  WARNING: {n_swapped}/{n} frames ({swap_ratio:.0%}) "
+                  f"flagged as swapped — likely false positives (angled "
+                  f"camera view?). Skipping swap correction.")
             return
 
         t_ranges = []
@@ -494,6 +519,57 @@ class RunningFormAnalyzer:
         plt.close()
         print(f"  Saved {path}")
 
+    def generate_lr_analysis(self, output_dir):
+        """Generate the L vs R heel analysis plot (pyramid wave diagnostic).
+
+        This is the most important diagnostic plot. In correctly tracked
+        running video, heel X positions trace pyramid waves 180 degrees
+        out of phase. Heel Y shows alternating ground contacts. The L-R
+        difference should maintain consistent sign (no remaining swaps).
+        """
+        print(f"\n--- Generating L/R corrected analysis plot ---")
+        times = np.arange(self.frame_count) / self.fps
+
+        l_heel_x = self.lm_x[:, LM_LEFT_HEEL] * self.width
+        r_heel_x = self.lm_x[:, LM_RIGHT_HEEL] * self.width
+        l_heel_y = self.lm_y[:, LM_LEFT_HEEL] * self.height
+        r_heel_y = self.lm_y[:, LM_RIGHT_HEEL] * self.height
+
+        fig, axes = plt.subplots(3, 1, figsize=(16, 12), sharex=True)
+        fig.suptitle("L vs R Heel — Corrected Analysis (Pyramid Wave Check)",
+                      fontsize=14, fontweight="bold")
+
+        # Heel X (horizontal) — the pyramid wave plot
+        ax = axes[0]
+        ax.plot(times, l_heel_x, linewidth=1.0, color="blue", label="L Heel X")
+        ax.plot(times, r_heel_x, linewidth=1.0, color="red", label="R Heel X")
+        ax.set_ylabel("X position (px)")
+        ax.set_title("Heel X (horizontal) — L vs R")
+        ax.legend(loc="upper right")
+
+        # Heel Y (vertical) — ground contacts
+        ax = axes[1]
+        ax.plot(times, l_heel_y, linewidth=1.0, color="blue", label="L Heel Y")
+        ax.plot(times, r_heel_y, linewidth=1.0, color="red", label="R Heel Y")
+        ax.set_ylabel("Y position (px)")
+        ax.set_title("Heel Y (vertical) — Ground Contacts")
+        ax.legend(loc="upper right")
+
+        # L-R difference
+        ax = axes[2]
+        diff = l_heel_x - r_heel_x
+        ax.plot(times, diff, linewidth=1.0, color="purple")
+        ax.axhline(0, color="gray", linestyle="--", alpha=0.5)
+        ax.set_ylabel("L - R (px)")
+        ax.set_title("L-R Heel X Difference (sign flips = remaining swaps)")
+        ax.set_xlabel("Time (s)")
+
+        plt.tight_layout()
+        path = os.path.join(output_dir, "lr_corrected_analysis.png")
+        plt.savefig(path, dpi=150)
+        plt.close()
+        print(f"  Saved {path}")
+
     def generate_skeleton_video(self, output_path):
         """Generate video with skeleton overlay from corrected landmark data."""
         print(f"\n--- Generating corrected skeleton video: {output_path} ---")
@@ -555,6 +631,7 @@ class RunningFormAnalyzer:
         raw_lm_y = self.lm_y.copy()
         self.correct_landmarks()
         self.generate_jitter_report(output_dir, raw_lm_x, raw_lm_y)
+        self.generate_lr_analysis(output_dir)
 
         # Skeleton video from corrected data
         if generate_video:
