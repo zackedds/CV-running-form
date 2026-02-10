@@ -211,7 +211,7 @@ class RunningFormAnalyzer:
         print(f"  Done. Landmarks detected in {det_count}/{frame_idx} frames "
               f"({100 * det_count / max(frame_idx, 1):.1f}%)")
 
-    def correct_landmarks(self, mad_multiplier=8.0, smooth_window=5):
+    def correct_landmarks(self, mad_multiplier=3.0, smooth_window=5):
         """Detect and fix landmark jitter using adaptive per-landmark thresholds.
 
         Fits a baseline from the median of frame-to-frame deltas, then flags
