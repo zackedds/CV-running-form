@@ -211,6 +211,58 @@ class RunningFormAnalyzer:
         print(f"  Done. Landmarks detected in {det_count}/{frame_idx} frames "
               f"({100 * det_count / max(frame_idx, 1):.1f}%)")
 
+    def fix_lr_swaps(self):
+        """Detect and fix left/right landmark identity swaps.
+
+        MediaPipe sometimes confuses which foot is left vs right, causing
+        smooth position crossovers. Detected by monitoring the sign of
+        L_heel_x - R_heel_x: the dominant sign is "correct", and frames
+        where it flips with a large magnitude are swapped.
+        """
+        print("\n--- Fixing left/right landmark swaps ---")
+
+        # Left/right landmark pairs to swap together
+        lr_pairs = [
+            (LM_LEFT_HIP, LM_RIGHT_HIP),
+            (LM_LEFT_KNEE, LM_RIGHT_KNEE),
+            (LM_LEFT_ANKLE, LM_RIGHT_ANKLE),
+            (LM_LEFT_HEEL, LM_RIGHT_HEEL),
+            (LM_LEFT_FOOT_INDEX, LM_RIGHT_FOOT_INDEX),
+            (LM_LEFT_SHOULDER, LM_RIGHT_SHOULDER),
+        ]
+
+        # Use heel X positions to determine which frames are swapped
+        l_x = self.lm_x[:, LM_LEFT_HEEL] * self.width
+        r_x = self.lm_x[:, LM_RIGHT_HEEL] * self.width
+        diff = l_x - r_x
+
+        # Determine the dominant sign (which side L heel is usually on)
+        valid = diff[~np.isnan(diff)]
+        if len(valid) == 0:
+            return
+        dominant_sign = np.sign(np.median(valid))
+
+        # Frames where sign disagrees with dominant AND the magnitude is
+        # significant (not just the feet crossing during a stride)
+        min_swap_magnitude = 20.0  # px — real swaps are ~80-120px
+        swapped = (np.sign(diff) != dominant_sign) & (np.abs(diff) > min_swap_magnitude)
+        n_swapped = np.sum(swapped)
+
+        if n_swapped == 0:
+            print("  No swaps detected")
+            return
+
+        print(f"  Detected {n_swapped} swapped frames, unswapping...")
+
+        # Swap left/right for all paired landmarks on those frames
+        for l_idx, r_idx in lr_pairs:
+            self.lm_x[swapped, l_idx], self.lm_x[swapped, r_idx] = \
+                self.lm_x[swapped, r_idx].copy(), self.lm_x[swapped, l_idx].copy()
+            self.lm_y[swapped, l_idx], self.lm_y[swapped, r_idx] = \
+                self.lm_y[swapped, r_idx].copy(), self.lm_y[swapped, l_idx].copy()
+            self.lm_z[swapped, l_idx], self.lm_z[swapped, r_idx] = \
+                self.lm_z[swapped, r_idx].copy(), self.lm_z[swapped, l_idx].copy()
+
     def correct_landmarks(self, mad_multiplier=3.0, smooth_window=5):
         """Detect and fix landmark jitter using adaptive per-landmark thresholds.
 
@@ -451,7 +503,10 @@ class RunningFormAnalyzer:
         # Phase 1: Extract landmarks
         self.extract_landmarks()
 
-        # Save raw copies for diagnostic plots, then correct
+        # Fix L/R swaps first, then jitter
+        self.fix_lr_swaps()
+
+        # Save raw copies for diagnostic plots, then correct jitter
         raw_lm_x = self.lm_x.copy()
         raw_lm_y = self.lm_y.copy()
         self.correct_landmarks()
