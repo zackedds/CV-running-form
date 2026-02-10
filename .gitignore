@@ -1,0 +1,4 @@
+*.mp4
+*.task
+output/
+__pycache__/
